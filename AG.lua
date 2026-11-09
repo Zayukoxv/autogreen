@@ -387,7 +387,7 @@ local function buildMenu()
     Library:OnUnload(unload)
 
     local Window = Library:CreateWindow({
-        Title = "Lilman is poor",
+        Title = "Auto Green",
         Size = Vector2.new(520, 420),
         MinSize = Vector2.new(470, 380),
         Resize = true,
@@ -396,7 +396,7 @@ local function buildMenu()
     local Main = Window:AddTab({ Title = "Main", Icon = "house" })
 
     local Shooting = Main:AddSection("Shooting")
-    Shooting:AddToggle({ Id = "agb_green", Title = "Lilman is poor", Default = S.green,
+    Shooting:AddToggle({ Id = "agb_green", Title = "Auto green", Default = S.green,
         Callback = function(v) S.green = v end })
     Shooting:AddToggle({ Id = "agb_cal", Title = "Auto calibrate", Default = S.cal,
         Callback = function(v) S.cal = v end })
