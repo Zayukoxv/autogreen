@@ -8,28 +8,130 @@ pcall(function() if _G.AGB_UNLOAD then _G.AGB_UNLOAD() end end)
 local CFG = {
     ShootKey = 0x45,
     JumpKey  = 0x20,
+    StealKey = 0x51,
     PeakY    = -1.475,
     Transit  = 0.015,
+    ActionFile = "agb_actions.txt",
 }
 local CAL_FILE = "agb_calibration.json"
 
 local S = {
-    green      = true,
-    cal        = true,
-    offset     = 0,
-    block      = true,
-    blockrange = 10,
-    blockdelay = 100,
+    green       = true,
+    cal         = true,
+    offset      = 0,
+    block       = true,
+    blockrange  = 12,
+    blockcone   = 70,
+    blockbase   = 1080,
+    blocklead   = 250,
+    blockmanual = 0,
+    blockcd     = 1500,
+    rebound     = true,
+    gravity     = 196,
+    floor       = 3,
+    steal       = true,
+    stealrange  = 6,
+    stealcone   = 60,
+    autosteal   = false,
+    stealcd     = 700,
 }
 
 local running = true
 local conns, drawings = {}, {}
-local ch, others = nil, {}
+local ch, myRoot, others, allChars = nil, nil, {}, {}
+local balls, tracks, heldBalls, goals = {}, {}, {}, {}
 local shot = { active = false, armed = false, released = false, ver = 0 }
 local network = { ping = nil, raw = nil, last = -1 }
 local calibration, calDirty, calSavedAt = {}, false, -10
-local blockAt, nextBlock, lastShotStart = nil, 0, {}
+local pending, nextBlock, nextSteal, lastSST = nil, 0, 0, {}
+local stealTargets = {}
+local actions, actionsDirty, actionsSavedAt = {}, false, 0
 local Library
+
+local pool = { Text = {}, Circle = {}, Line = {} }
+local used = { Text = 0, Circle = 0, Line = 0 }
+
+local GREEN  = Color3.fromRGB(90, 220, 130)
+local YELLOW = Color3.fromRGB(240, 200, 70)
+local RED    = Color3.fromRGB(235, 90, 90)
+local WHITE  = Color3.fromRGB(230, 230, 235)
+
+local function trySet(d, k, v)
+    pcall(function() d[k] = v end)
+end
+
+local function setFontSize(d, n)
+    trySet(d, "FontSize", n)
+    trySet(d, "Size", n)
+end
+
+local function getObj(kind)
+    local p = pool[kind]
+    local i = used[kind] + 1
+    used[kind] = i
+    local d = p[i]
+    if not d then
+        d = Drawing.new(kind)
+        p[i] = d
+        drawings[#drawings + 1] = d
+    end
+    return d
+end
+
+local function beginFrame()
+    for k in pairs(used) do used[k] = 0 end
+end
+
+local function endFrame()
+    for kind, p in pairs(pool) do
+        for i = used[kind] + 1, #p do
+            trySet(p[i], "Visible", false)
+        end
+    end
+end
+
+local function drawText(text, x, y, color, size)
+    local d = getObj("Text")
+    trySet(d, "Text", text)
+    trySet(d, "Center", true)
+    trySet(d, "Outline", true)
+    trySet(d, "Color", color)
+    trySet(d, "Transparency", 1)
+    trySet(d, "Position", Vector2.new(x, y))
+    setFontSize(d, size)
+    trySet(d, "ZIndex", 5)
+    trySet(d, "Visible", true)
+end
+
+local function drawCircle(x, y, r, color, thick)
+    local d = getObj("Circle")
+    trySet(d, "Radius", r)
+    trySet(d, "NumSides", 24)
+    trySet(d, "Thickness", thick)
+    trySet(d, "Filled", false)
+    trySet(d, "Color", color)
+    trySet(d, "Transparency", 1)
+    trySet(d, "Position", Vector2.new(x, y))
+    trySet(d, "ZIndex", 4)
+    trySet(d, "Visible", true)
+end
+
+local function drawLine(x1, y1, x2, y2, color, thick)
+    local d = getObj("Line")
+    trySet(d, "From", Vector2.new(x1, y1))
+    trySet(d, "To", Vector2.new(x2, y2))
+    trySet(d, "Thickness", thick)
+    trySet(d, "Color", color)
+    trySet(d, "Transparency", 1)
+    trySet(d, "ZIndex", 3)
+    trySet(d, "Visible", true)
+end
+
+local function attr(inst, name)
+    local ok, v = pcall(function() return inst:GetAttribute(name) end)
+    if ok then return v end
+    return nil
+end
 
 local function updatePing(now)
     if now - network.last < 0.2 then return end
@@ -111,16 +213,56 @@ local function iHaveBall()
     return b ~= nil and b.Value ~= nil
 end
 
+local function hasBall(model)
+    local a = model:FindFirstChild("Attributes")
+    local b = a and a:FindFirstChild("Basketball")
+    return b ~= nil and b.Value ~= nil
+end
+
 local function refresh()
     ch = getChar()
-    others = {}
+    myRoot = ch and ch:FindFirstChild("HumanoidRootPart")
+    others, allChars = {}, {}
+    if ch then allChars[1] = ch end
     local f = workspace:FindFirstChild("Characters")
-    if not f then return end
-    for _, c in ipairs(f:GetChildren()) do
-        if c.Name ~= lp.Name and c.Name ~= "InvisCharacter" then
-            local r = c:FindFirstChild("HumanoidRootPart")
-            if r then others[#others + 1] = { model = c, root = r } end
+    if f then
+        for _, c in ipairs(f:GetChildren()) do
+            if c.Name ~= lp.Name and c.Name ~= "InvisCharacter" then
+                local r = c:FindFirstChild("HumanoidRootPart")
+                if r then
+                    others[#others + 1] = { model = c, root = r, name = c.Name }
+                    allChars[#allChars + 1] = c
+                end
+            end
         end
+    end
+    balls = {}
+    local bf = workspace:FindFirstChild("Basketballs")
+    if bf then
+        for _, b in ipairs(bf:GetChildren()) do balls[#balls + 1] = b end
+    end
+end
+
+local function refreshGoals()
+    goals = {}
+    local hf = workspace:FindFirstChild("Hoops")
+    if not hf then return end
+    for _, h in ipairs(hf:GetChildren()) do
+        local g = h:FindFirstChild("Goal")
+        if g then
+            local ok, p = pcall(function() return g.Position end)
+            if ok and p then goals[#goals + 1] = p end
+        end
+    end
+end
+
+local function updateHeld()
+    heldBalls = {}
+    for _, m in ipairs(allChars) do
+        local a = m:FindFirstChild("Attributes")
+        local b = a and a:FindFirstChild("Basketball")
+        local v = b and b.Value
+        if v then heldBalls[v] = true end
     end
 end
 
@@ -243,6 +385,53 @@ local function shotStep()
     end
 end
 
+local function lookDir(root)
+    local ok, x, z = pcall(function()
+        local lv = root.CFrame.LookVector
+        local m = math.sqrt(lv.X * lv.X + lv.Z * lv.Z)
+        return lv.X / m, lv.Z / m
+    end)
+    if ok then return x, z end
+    return nil, nil
+end
+
+local function coneOk(fromPos, towardPos, viewerPos, deg)
+    local ax, az = towardPos.X - fromPos.X, towardPos.Z - fromPos.Z
+    local bx, bz = viewerPos.X - fromPos.X, viewerPos.Z - fromPos.Z
+    local am = math.sqrt(ax * ax + az * az)
+    local bm = math.sqrt(bx * bx + bz * bz)
+    if am < 0.001 or bm < 0.001 then return true end
+    return (ax * bx + az * bz) / (am * bm) >= math.cos(math.rad(deg))
+end
+
+local function goalFor(o)
+    local a = o.model:FindFirstChild("Attributes")
+    local g = a and a:FindFirstChild("Goal")
+    local part = g and g.Value
+    if part then
+        local ok, p = pcall(function() return part.Position end)
+        if ok and p then return p end
+    end
+    local lx, lz = lookDir(o.root)
+    local sp = o.root.Position
+    local best, bestDot = nil, -2
+    for _, gp in ipairs(goals) do
+        local dx, dz = gp.X - sp.X, gp.Z - sp.Z
+        local m = math.sqrt(dx * dx + dz * dz)
+        if m > 0.001 then
+            local dot = lx and ((dx * lx + dz * lz) / m) or 0
+            if dot > bestDot then best, bestDot = gp, dot end
+        end
+    end
+    return best
+end
+
+local function isOpponent(model)
+    local myTeam = ch and ch:GetAttribute("Team") or 0
+    local team = model:GetAttribute("Team")
+    return myTeam == 0 or team ~= myTeam
+end
+
 local function fireJump()
     local ok = pcall(function()
         local r = RS.Aero.AeroRemoteServices.InputService.Jump
@@ -255,46 +444,197 @@ local function fireJump()
     end
 end
 
+local function pressSteal()
+    keypress(CFG.StealKey)
+    wait(0.03)
+    keyrelease(CFG.StealKey)
+end
+
+local function scanShots()
+    for _, o in ipairs(others) do
+        local sst = o.model:GetAttribute("ShotStartTime")
+        local prev = lastSST[o.name]
+        lastSST[o.name] = sst
+        o.started = sst ~= nil and prev ~= nil and sst ~= prev and o.model:GetAttribute("ReleasedShot") == false
+    end
+end
+
 local function blockStep(now)
-    if blockAt and now >= blockAt then
-        blockAt = nil
-        if S.block and isrbxactive() and not iHaveBall() then
+    if pending and now >= pending.at then
+        pending = nil
+        if S.block and isrbxactive() and not iHaveBall() and attr(ch, "InAir") ~= true then
             task.spawn(fireJump)
         end
     end
-    if not S.block or blockAt or now < nextBlock or shot.active then return end
-    if not ch or iHaveBall() then return end
-    local root = ch:FindFirstChild("HumanoidRootPart")
-    local myPos = root and root.Position
-    if not myPos then return end
-    local myTeam = ch:GetAttribute("Team") or 0
+    if not S.block or pending or now < nextBlock or shot.active then return end
+    if not ch or not myRoot or iHaveBall() then return end
+    local myPos = myRoot.Position
     for _, o in ipairs(others) do
-        local key = o.model.Name
-        local p = o.root.Position
-        if p and (p - myPos).Magnitude <= S.blockrange then
-            local sst = o.model:GetAttribute("ShotStartTime")
-            local prev = lastShotStart[key]
-            lastShotStart[key] = sst
-            if sst and prev and sst ~= prev then
-                local team = o.model:GetAttribute("Team")
-                if myTeam == 0 or team ~= myTeam then
-                    blockAt, nextBlock = now + S.blockdelay / 1000, now + 1.5
+        if o.started then
+            local sp = o.root.Position
+            local dx, dy, dz = sp.X - myPos.X, sp.Y - myPos.Y, sp.Z - myPos.Z
+            local dist = math.sqrt(dx * dx + dy * dy + dz * dz)
+            if dist <= S.blockrange and isOpponent(o.model) then
+                local gp = goalFor(o)
+                if not gp or coneOk(sp, gp, myPos, S.blockcone) then
+                    local speed = attr(o.model, "ShotSpeed")
+                    if type(speed) ~= "number" or speed <= 0 then speed = 1.8 end
+                    local delay = S.blockbase / speed - S.blocklead - (network.ping or 53) + S.blockmanual
+                    if delay < 0 then delay = 0 end
+                    pending = { at = now + delay / 1000, name = o.name, delay = delay }
+                    nextBlock = now + S.blockcd / 1000
                     return
                 end
             end
-        else
-            lastShotStart[key] = nil
         end
     end
 end
 
-local function trySet(d, k, v)
-    pcall(function() d[k] = v end)
+local function stealStep(now)
+    stealTargets = {}
+    if not S.steal or not ch or not myRoot then return end
+    if iHaveBall() then return end
+    local myPos = myRoot.Position
+    local lx, lz = lookDir(myRoot)
+    for _, o in ipairs(others) do
+        if hasBall(o.model) and isOpponent(o.model) then
+            local p = o.root.Position
+            local dx, dz = p.X - myPos.X, p.Z - myPos.Z
+            local dist = math.sqrt(dx * dx + dz * dz)
+            if dist <= S.stealrange * 2 then
+                local inCone = true
+                if lx and dist > 0.001 then
+                    inCone = (dx * lx + dz * lz) / dist >= math.cos(math.rad(S.stealcone))
+                end
+                local shooting = o.model:GetAttribute("Action") == "Shooting"
+                local inRange = dist <= S.stealrange
+                local ready = inRange and inCone and not shooting
+                stealTargets[#stealTargets + 1] = { pos = p, dist = dist, ready = ready, inRange = inRange }
+                if ready and S.autosteal and now >= nextSteal and isrbxactive() then
+                    nextSteal = now + S.stealcd / 1000
+                    task.spawn(pressSteal)
+                end
+            end
+        end
+    end
 end
 
-local function setFontSize(d, n)
-    trySet(d, "FontSize", n)
-    trySet(d, "Size", n)
+local function trackActions()
+    for _, m in ipairs(allChars) do
+        local a = m:GetAttribute("Action")
+        if type(a) == "string" and a ~= "" then
+            actions[a] = (actions[a] or 0) + 1
+            actionsDirty = true
+        end
+    end
+end
+
+local function saveActions(now)
+    if not actionsDirty or now - actionsSavedAt < 10 then return end
+    actionsSavedAt = now
+    local keys = {}
+    for k in pairs(actions) do keys[#keys + 1] = k end
+    table.sort(keys)
+    local lines = {}
+    for _, k in ipairs(keys) do lines[#lines + 1] = k .. "\t" .. actions[k] end
+    local ok = pcall(function() writefile(CFG.ActionFile, table.concat(lines, "\n")) end)
+    if ok then actionsDirty = false end
+end
+
+local function reboundFrame(now)
+    if not myRoot then return end
+    local myPos = myRoot.Position
+    local floorY = myPos.Y - S.floor
+    local g = S.gravity
+    for _, ball in ipairs(balls) do
+        if heldBalls[ball] then
+            tracks[ball] = nil
+        else
+            local ok, pos = pcall(function() return ball.Position end)
+            if ok and pos then
+                local tr = tracks[ball]
+                if not tr then
+                    tracks[ball] = { x = pos.X, y = pos.Y, z = pos.Z, t = now }
+                else
+                    local dt = now - tr.t
+                    if dt > 0.004 then
+                        local vx, vy, vz = (pos.X - tr.x) / dt, (pos.Y - tr.y) / dt, (pos.Z - tr.z) / dt
+                        if tr.vx then
+                            tr.vx, tr.vy, tr.vz = tr.vx * 0.6 + vx * 0.4, tr.vy * 0.6 + vy * 0.4, tr.vz * 0.6 + vz * 0.4
+                        else
+                            tr.vx, tr.vy, tr.vz = vx, vy, vz
+                        end
+                        tr.x, tr.y, tr.z, tr.t = pos.X, pos.Y, pos.Z, now
+                    end
+                    if tr.vx then
+                        local speed = math.sqrt(tr.vx * tr.vx + tr.vy * tr.vy + tr.vz * tr.vz)
+                        if speed > 4 then
+                            local disc = tr.vy * tr.vy + 2 * g * (tr.y - floorY)
+                            if disc >= 0 then
+                                local t = (tr.vy + math.sqrt(disc)) / g
+                                if t > 0.05 and t < 5 then
+                                    local lx, lz = tr.x + tr.vx * t, tr.z + tr.vz * t
+                                    local sp, on = WorldToScreen(Vector3.new(lx, floorY, lz))
+                                    if on then
+                                        local dx, dz = lx - myPos.X, lz - myPos.Z
+                                        local myDist = math.sqrt(dx * dx + dz * dz)
+                                        local closest = true
+                                        for _, o in ipairs(others) do
+                                            local p = o.root.Position
+                                            local ox, oz = lx - p.X, lz - p.Z
+                                            if math.sqrt(ox * ox + oz * oz) < myDist then
+                                                closest = false
+                                                break
+                                            end
+                                        end
+                                        local color = closest and GREEN or RED
+                                        drawCircle(sp.X, sp.Y, 16, color, 2)
+                                        local label = string.format("%s  %.1fs  %.0f", attr(ball, "MidShot") and "SHOT" or "REB", t, myDist)
+                                        drawText(label, sp.X, sp.Y - 30, color, 16)
+                                        local bp, bon = WorldToScreen(Vector3.new(tr.x, tr.y, tr.z))
+                                        if bon then drawLine(bp.X, bp.Y, sp.X, sp.Y, color, 1) end
+                                    end
+                                end
+                            end
+                        end
+                    end
+                end
+            end
+        end
+    end
+end
+
+local function drawSteal()
+    for _, t in ipairs(stealTargets) do
+        local sp, on = WorldToScreen(t.pos)
+        if on then
+            local color = t.ready and GREEN or (t.inRange and YELLOW or WHITE)
+            drawCircle(sp.X, sp.Y, t.ready and 26 or 20, color, t.ready and 3 or 1)
+            drawText(string.format("%.1f", t.dist), sp.X, sp.Y + 30, color, 14)
+            if t.ready then drawText("STEAL", sp.X, sp.Y - 44, GREEN, 18) end
+        end
+    end
+end
+
+local function drawBlock(now)
+    if not pending then return end
+    local left = (pending.at - now) * 1000
+    local w, h = 1920, 1080
+    pcall(function()
+        local v = workspace.CurrentCamera.ViewportSize
+        if v and v.X > 0 then w, h = v.X, v.Y end
+    end)
+    drawText(string.format("BLOCK %dms  %s", math.max(0, left), pending.name), w / 2, h * 0.2, YELLOW, 20)
+end
+
+local function frame()
+    if not running then return end
+    beginFrame()
+    local now = tick()
+    if S.rebound then pcall(reboundFrame, now) end
+    pcall(drawSteal)
+    pcall(drawBlock, now)
+    endFrame()
 end
 
 local function makeLoader()
@@ -375,6 +715,8 @@ local function unload()
     running = false
     shot.ver = shot.ver + 1
     flushCalibration(tick() + 10)
+    actionsDirty = true
+    saveActions(tick() + 100)
     for _, c in ipairs(conns) do pcall(function() c:Disconnect() end) end
     for _, d in ipairs(drawings) do pcall(function() d:Remove() end) end
     if Library and not Library.Unloaded then pcall(function() Library:Destroy() end) end
@@ -388,8 +730,8 @@ local function buildMenu()
 
     local Window = Library:CreateWindow({
         Title = "Auto Green",
-        Size = Vector2.new(520, 420),
-        MinSize = Vector2.new(470, 380),
+        Size = Vector2.new(540, 620),
+        MinSize = Vector2.new(480, 460),
         Resize = true,
         MinimizeKey = "End",
     })
@@ -404,16 +746,44 @@ local function buildMenu()
         Default = S.offset, Rounding = 0, Callback = function(v) S.offset = v end })
     Shooting:AddButton({ Title = "Reset learned timing", Callback = resetCalibration })
 
-    local Defense = Main:AddSection("Defense")
+    local Defense = Main:AddSection("Auto block")
     Defense:AddToggle({ Id = "agb_block", Title = "Auto block", Default = S.block,
         Callback = function(v) S.block = v end })
-    Defense:AddSlider({ Id = "agb_blockrange", Title = "Block range (studs)", Min = 4, Max = 16,
-        Default = S.blockrange, Rounding = 1, Callback = function(v) S.blockrange = v end })
-    Defense:AddSlider({ Id = "agb_blockdelay", Title = "Block delay (ms)", Min = 0, Max = 400,
-        Default = S.blockdelay, Rounding = 0, Callback = function(v) S.blockdelay = v end })
+    Defense:AddSlider({ Id = "agb_blockrange", Title = "Range (studs)", Min = 4, Max = 30,
+        Default = S.blockrange, Rounding = 0, Callback = function(v) S.blockrange = v end })
+    Defense:AddSlider({ Id = "agb_blockcone", Title = "Cone vs hoop (deg)", Min = 20, Max = 120,
+        Default = S.blockcone, Rounding = 0, Callback = function(v) S.blockcone = v end })
+    Defense:AddSlider({ Id = "agb_blockbase", Title = "Shot length at speed 1.0 (ms)", Min = 600, Max = 1800,
+        Default = S.blockbase, Rounding = 0, Callback = function(v) S.blockbase = v end })
+    Defense:AddSlider({ Id = "agb_blocklead", Title = "Jump lead (ms)", Min = 0, Max = 600,
+        Default = S.blocklead, Rounding = 0, Callback = function(v) S.blocklead = v end })
+    Defense:AddSlider({ Id = "agb_blockmanual", Title = "Fine tune (ms)", Min = -200, Max = 200,
+        Default = S.blockmanual, Rounding = 0, Callback = function(v) S.blockmanual = v end })
+    Defense:AddSlider({ Id = "agb_blockcd", Title = "Cooldown (ms)", Min = 300, Max = 3000,
+        Default = S.blockcd, Rounding = 0, Callback = function(v) S.blockcd = v end })
+
+    local Rebound = Main:AddSection("Rebound assist")
+    Rebound:AddToggle({ Id = "agb_rebound", Title = "Landing marker", Default = S.rebound,
+        Callback = function(v) S.rebound = v end })
+    Rebound:AddSlider({ Id = "agb_gravity", Title = "Ball gravity", Min = 50, Max = 400,
+        Default = S.gravity, Rounding = 0, Callback = function(v) S.gravity = v end })
+    Rebound:AddSlider({ Id = "agb_floor", Title = "Floor offset", Min = 0, Max = 6,
+        Default = S.floor, Rounding = 1, Callback = function(v) S.floor = v end })
+
+    local Steal = Main:AddSection("Steal timing")
+    Steal:AddToggle({ Id = "agb_steal", Title = "Steal indicator", Default = S.steal,
+        Callback = function(v) S.steal = v end })
+    Steal:AddSlider({ Id = "agb_stealrange", Title = "Range (studs)", Min = 3, Max = 14,
+        Default = S.stealrange, Rounding = 1, Callback = function(v) S.stealrange = v end })
+    Steal:AddSlider({ Id = "agb_stealcone", Title = "Facing cone (deg)", Min = 20, Max = 120,
+        Default = S.stealcone, Rounding = 0, Callback = function(v) S.stealcone = v end })
+    Steal:AddToggle({ Id = "agb_autosteal", Title = "Auto steal", Default = S.autosteal,
+        Callback = function(v) S.autosteal = v end })
+    Steal:AddSlider({ Id = "agb_stealcd", Title = "Steal cooldown (ms)", Min = 300, Max = 3000,
+        Default = S.stealcd, Rounding = 0, Callback = function(v) S.stealcd = v end })
 
     local Script = Main:AddSection("Script")
-    Script:AddParagraph({ Title = "Keys", Content = "Shoot = E or Space. End hides the menu." })
+    Script:AddParagraph({ Title = "Keys", Content = "Shoot = E or Space. Steal = Q. End hides the menu." })
     Script:AddButton({ Title = "Unload", Callback = unload })
 end
 
@@ -424,6 +794,7 @@ task.spawn(function()
         loadCalibration()
         loader.set(0.5, "Finding character")
         refresh()
+        refreshGoals()
         updatePing(tick())
         loader.set(0.75, "Building menu")
         buildMenu()
@@ -440,6 +811,7 @@ task.spawn(function()
         pcall(shotStep)
     end
     conns[#conns + 1] = RunService.RenderStepped:Connect(safeShot)
+    conns[#conns + 1] = RunService.RenderStepped:Connect(frame)
     task.spawn(function()
         while running do
             wait(0.005)
@@ -448,15 +820,21 @@ task.spawn(function()
     end)
 
     task.spawn(function()
-        local lastRefresh = 0
+        local lastRefresh, lastGoals = 0, 0
         while running do
             wait(0.03)
             local now = tick()
             pcall(function()
                 updatePing(now)
                 if now - lastRefresh >= 0.5 then lastRefresh = now refresh() end
+                if now - lastGoals >= 3 then lastGoals = now refreshGoals() end
+                updateHeld()
+                scanShots()
+                trackActions()
                 blockStep(now)
+                stealStep(now)
                 flushCalibration(now)
+                saveActions(now)
             end)
         end
     end)
